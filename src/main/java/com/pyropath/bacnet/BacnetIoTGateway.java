@@ -7,12 +7,15 @@ import com.serotonin.bacnet4j.npdu.ip.IpNetwork;
 import com.serotonin.bacnet4j.npdu.ip.IpNetworkBuilder;
 import com.serotonin.bacnet4j.obj.AnalogInputObject;
 import com.serotonin.bacnet4j.obj.BinaryInputObject;
+import com.serotonin.bacnet4j.obj.DeviceObject;
 import com.serotonin.bacnet4j.service.unconfirmed.WhoIsRequest;
 import com.serotonin.bacnet4j.transport.DefaultTransport;
 import com.serotonin.bacnet4j.type.enumerated.BinaryPV;
 import com.serotonin.bacnet4j.type.enumerated.EngineeringUnits;
+import com.serotonin.bacnet4j.type.enumerated.ObjectType;
 import com.serotonin.bacnet4j.type.enumerated.Polarity;
 import com.serotonin.bacnet4j.type.enumerated.PropertyIdentifier;
+import com.serotonin.bacnet4j.type.primitive.ObjectIdentifier;
 import com.serotonin.bacnet4j.type.primitive.Real;
 
 import java.util.*;
@@ -36,17 +39,30 @@ public class BacnetIoTGateway {
                 .build();
 
         DefaultTransport transport = new DefaultTransport(network);
+
+        // DeviceObject is automatically created in the LocalDevice constructor.
         localDevice = new LocalDevice(DEVICE_ID, transport);
         localDevice.initialize();
 
+        // Create sensor objects if not already present.
         setupObjects();
         startPolling();
 
         System.out.println("BACnet IoT Gateway running...");
         localDevice.sendGlobalBroadcast(new WhoIsRequest());
+
+        // Add clean shutdown:
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                localDevice.terminate();
+                System.out.println("BACnet local device terminated.");
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }));
     }
 
-    private static void setupObjects() throws BACnetException {
+    private static void setupObjects() {
         List<Map<String, Object>> sensors = getSensors();
 
         for (Map<String, Object> sensor : sensors) {
@@ -54,33 +70,38 @@ public class BacnetIoTGateway {
             String name = (String) sensor.get("name");
             String type = (String) sensor.get("type");
 
-            if ("AI".equals(type)) {
-                //public AnalogInputObject(LocalDevice localDevice, int instanceNumber, String name, float presentValue, EngineeringUnits units, boolean outOfService)
-                EngineeringUnits unit = EngineeringUnits.partsPerMillion;
-                AnalogInputObject ai;
-                try {
+            // Create an object identifier based on type and id.
+            ObjectIdentifier oid = new ObjectIdentifier(
+                    "AI".equals(type) ? ObjectType.analogInput : ObjectType.binaryInput,
+                    id
+            );
 
-                    ai = new AnalogInputObject(localDevice, id, name, 0.0f, unit, false);
-                    localDevice.addObject(ai);
+            // Check if the object is already registered in the LocalDevice.
+            if (localDevice.getObject(oid) != null) {
+                Logger.getLogger(BacnetIoTGateway.class.getName()).log(Level.WARNING,
+                        "Object with ID {0} already exists. Using the existing object.", id);
+                // Update our maps so we can later update the value.
+                if ("AI".equals(type)) {
+                    analogInputs.put(id, (AnalogInputObject) localDevice.getObject(oid));
+                } else if ("BI".equals(type)) {
+                    binaryInputs.put(id, (BinaryInputObject) localDevice.getObject(oid));
+                }
+                continue;
+            }
+
+            try {
+                // Instantiate the sensor object.
+                // The constructors of AnalogInputObject and BinaryInputObject auto-register the object
+                // with the LocalDevice, so there's no need to call localDevice.addObject() explicitly.
+                if ("AI".equals(type)) {
+                    AnalogInputObject ai = new AnalogInputObject(localDevice, id, name, 0.0f, EngineeringUnits.partsPerMillion, false);
                     analogInputs.put(id, ai);
-
-                } catch (BACnetServiceException ex) {
-                    Logger.getLogger(BacnetIoTGateway.class.getName()).log(Level.SEVERE, null, ex);
-                }
-
-            } else if ("BI".equals(type)) {
-                // public BinaryInputObject(LocalDevice localDevice, int instanceNumber, String name, BinaryPV presentValue, boolean outOfService, Polarity polarity)
-                BinaryPV presentValue = BinaryPV.active;
-                Polarity polarity = Polarity.normal;
-                BinaryInputObject bi;
-                try {
-                    bi = new BinaryInputObject(localDevice, id, name, presentValue, false, polarity);
-                    localDevice.addObject(bi);
+                } else if ("BI".equals(type)) {
+                    BinaryInputObject bi = new BinaryInputObject(localDevice, id, name, BinaryPV.inactive, false, Polarity.normal);
                     binaryInputs.put(id, bi);
-                } catch (BACnetServiceException ex) {
-                    Logger.getLogger(BacnetIoTGateway.class.getName()).log(Level.SEVERE, null, ex);
                 }
-
+            } catch (Exception ex) {
+                Logger.getLogger(BacnetIoTGateway.class.getName()).log(Level.SEVERE, "Could not create sensor object: " + id, ex);
             }
         }
     }
@@ -94,19 +115,10 @@ public class BacnetIoTGateway {
                 Object value = getSensorData(id);
 
                 if (analogInputs.containsKey(id)) {
-                    
-                    //analogInputs.get(id).setPresentValue((float) value);
-                    analogInputs.get(id).writePropertyInternal(PropertyIdentifier.presentValue, new Real((float)value));
+                    analogInputs.get(id).writePropertyInternal(PropertyIdentifier.presentValue, new Real((float) value));
                     System.out.println("Updated " + analogInputs.get(id).getObjectName() + " to " + value);
                 } else if (binaryInputs.containsKey(id)) {
-                    
-                    //binaryInputs.get(id).setPresentValue((boolean) value);
-                    BinaryPV pValue;
-                    if((boolean)value){
-                        pValue = BinaryPV.active;
-                    }else{
-                        pValue = BinaryPV.inactive;
-                    }
+                    BinaryPV pValue = ((boolean) value) ? BinaryPV.active : BinaryPV.inactive;
                     binaryInputs.get(id).writePropertyInternal(PropertyIdentifier.presentValue, pValue);
                     System.out.println("Updated " + binaryInputs.get(id).getObjectName() + " to " + value);
                 }
